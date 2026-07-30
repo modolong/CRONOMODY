@@ -320,33 +320,148 @@ def registrar_estudo(subject_id, minutos, tipo):
     )
 
 
+# ---- Filtros de limpeza para materiais médicos (remoção de ruído) ---------
+# Padrões típicos de cabeçalho/rodapé/marca d'água/avisos legais em apostilas e livros
+PADROES_RUIDO = [
+    r"^p[aá]gina\s*\d+", r"^\d+\s*/\s*\d+$", r"^\d{1,4}$",
+    r"^www\.", r"https?://", r"^\S+@\S+\.\S+$",  # sites e e-mails isolados
+    r"^©", r"todos os direitos reservados", r"^isbn", r"^copyright",
+    r"confidencial", r"amostra gr[aá]tis", r"^vers[aã]o\s+demonstrativa$",
+    r"n[aã]o\s+comercializ", r"reproduç[aã]o proibida", r"material\s+did[aá]tico",
+    r"^cap[ií]tulo\s*\d+$", r"^sum[aá]rio$", r"^[\-_=]{3,}$", r"^anexo\s*[iv\d]+$",
+    r"^edi[cç][aã]o\s*:?", r"impresso no brasil", r"todos os direitos autorais",
+]
+PADROES_RUIDO_RE = re.compile("|".join(PADROES_RUIDO), re.IGNORECASE)
+
+# Vocabulário-âncora para validar relevância clínica/médica de uma frase.
+# Frases sem nenhum destes indícios são tratadas como ruído/contexto não essencial.
+TERMOS_MEDICOS = [
+    "diagnóstic", "tratamento", "sintoma", "síndrome", "doença", "paciente",
+    "clínic", "fisiopatolog", "farmac", "anatôm", "anatomia", "patolog",
+    "terapêutic", "cirurg", "exame", "prognós", "etiolog", "epidemiolog",
+    "hospital", "medicament", "dose", "posologia", "infec", "inflama",
+    "tumor", "câncer", "neoplas", "cardíac", "cardiovascular", "pulmonar",
+    "respirat", "renal", "hepátic", "neurológ", "neuronal", "endócrin",
+    "hormôn", "vacina", "vírus", "bactéria", "antibiótic", "lesão",
+    "biópsia", "histológic", "célula", "tecido", "órgão", "sangue",
+    "sistema imun", "músculo", "esquelétic", "reflexo", "artéria", "veia",
+    "gestaç", "pediátri", "geriátri", "psiquiátri", "ortopéd", "dermatológ",
+    "oncológ", "metaból", "fisiológ", "anestes", "vacinaç", "imunológ",
+]
+SUFIXOS_MEDICOS = (
+    "ite", "ose", "emia", "patia", "ectomia", "oma", "algia", "grafia",
+    "terapia", "plastia", "scopia", "trofia", "gênese",
+)
+
+
+def eh_ruido(linha: str) -> bool:
+    """Detecta se uma linha é cabeçalho, rodapé, numeração de página ou marca d'água."""
+    l = linha.strip()
+    if not l or len(l) <= 3:
+        return True
+    if PADROES_RUIDO_RE.search(l):
+        return True
+    # Linhas curtas totalmente em maiúsculas tendem a ser cabeçalhos/títulos repetidos de página
+    if l.isupper() and len(l.split()) <= 3:
+        return True
+    return False
+
+
+def eh_conteudo_medico(frase: str) -> bool:
+    """
+    Heurística que valida se uma frase é essencialmente conteúdo médico
+    (e não ruído editorial, institucional ou administrativo do material).
+    """
+    f = frase.lower()
+    if any(termo in f for termo in TERMOS_MEDICOS):
+        return True
+    for p in f.split():
+        p_limpo = p.strip(".,;:()")
+        if len(p_limpo) > 7 and p_limpo.endswith(SUFIXOS_MEDICOS):
+            return True
+    return False
+
+
+def remover_cabecalhos_rodapes_repetidos(paginas: list) -> list:
+    """
+    Detecta linhas que se repetem de forma idêntica em várias páginas do PDF
+    (típico de cabeçalhos, rodapés e marcas d'água institucionais) e as remove
+    de todas as ocorrências, preservando apenas o conteúdo único de cada página.
+    """
+    if len(paginas) < 2:
+        return paginas
+    contagem = {}
+    for pagina in paginas:
+        linhas_unicas = {l.strip() for l in pagina.split("\n") if l.strip()}
+        for l in linhas_unicas:
+            contagem[l] = contagem.get(l, 0) + 1
+    # Considera "repetida" (logo, ruído) uma linha presente em ao menos 1/3 das páginas
+    limite_repeticao = max(2, len(paginas) // 3)
+    linhas_repetidas = {l for l, c in contagem.items() if c >= limite_repeticao and len(l) < 120}
+    novas_paginas = []
+    for pagina in paginas:
+        linhas_filtradas = [l for l in pagina.split("\n") if l.strip() not in linhas_repetidas]
+        novas_paginas.append("\n".join(linhas_filtradas))
+    return novas_paginas
+
+
+def limpar_texto_medico(texto: str) -> str:
+    """
+    Pipeline de limpeza de conteúdo: remove ruído linha a linha (rodapés,
+    numeração de página, marcas d'água, avisos legais/editoriais), preservando
+    apenas texto que representa efetivamente o conteúdo do material médico.
+    """
+    linhas = texto.split("\n")
+    linhas_limpas = [l for l in linhas if not eh_ruido(l)]
+    return "\n".join(linhas_limpas)
+
+
 # ---- Extração e geração de conteúdo a partir de PDF/TXT --------------------
-def extrair_texto_arquivo(uploaded_file) -> str:
-    """Extrai texto de um arquivo PDF ou TXT enviado pelo usuário."""
-    texto = ""
+def extrair_texto_arquivo(uploaded_file):
+    """
+    Extrai texto de um arquivo PDF ou TXT enviado pelo usuário, já aplicando
+    a limpeza de cabeçalhos/rodapés/marcas d'água. Retorna uma tupla
+    (texto_limpo, estatisticas) onde estatisticas informa quantas linhas
+    de ruído foram descartadas, para transparência com o usuário.
+    """
+    texto_bruto = ""
     try:
         if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
             if PdfReader is None:
                 st.error("Biblioteca de leitura de PDF não encontrada. Instale 'pypdf'.")
-                return ""
+                return "", {}
             reader = PdfReader(uploaded_file)
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                texto += page_text + "\n"
+            paginas = [(page.extract_text() or "") for page in reader.pages]
+            # 1ª etapa: remove cabeçalhos/rodapés/marcas d'água repetidos entre páginas
+            paginas_sem_repeticao = remover_cabecalhos_rodapes_repetidos(paginas)
+            texto_bruto = "\n".join(paginas_sem_repeticao)
         else:
-            texto = uploaded_file.read().decode("utf-8", errors="ignore")
+            texto_bruto = uploaded_file.read().decode("utf-8", errors="ignore")
     except Exception as e:
         st.error(f"Erro ao ler o arquivo: {e}")
-    return texto
+        return "", {}
+
+    linhas_antes = len([l for l in texto_bruto.split("\n") if l.strip()])
+    # 2ª etapa: remove ruído linha a linha (numeração, avisos legais, etc.)
+    texto_limpo = limpar_texto_medico(texto_bruto)
+    linhas_depois = len([l for l in texto_limpo.split("\n") if l.strip()])
+
+    estatisticas = {
+        "linhas_removidas": linhas_antes - linhas_depois,
+        "linhas_antes": linhas_antes,
+        "linhas_depois": linhas_depois,
+    }
+    return texto_limpo, estatisticas
 
 
 def extrair_topicos(texto: str, max_topicos: int = 25):
     """
     Heurística leve de extração de tópicos: identifica linhas curtas,
     numeradas ou em caixa alta que costumam representar títulos de
-    seções em editais e apostilas.
+    seções em apostilas/editais, já ignorando linhas de ruído
+    (cabeçalhos, rodapés, numeração de página e marcas d'água).
     """
-    linhas = [l.strip() for l in texto.split("\n") if l.strip()]
+    linhas = [l.strip() for l in texto.split("\n") if l.strip() and not eh_ruido(l)]
     topicos = []
     padrao_numerado = re.compile(r"^(\d+[\.\)]|\u2022|-)\s*.+")
     for linha in linhas:
@@ -363,7 +478,7 @@ def extrair_topicos(texto: str, max_topicos: int = 25):
         if len(topicos) >= max_topicos:
             break
     if not topicos:
-        # Fallback: usa as primeiras frases como pseudo-tópicos
+        # Fallback: usa as primeiras frases relevantes como pseudo-tópicos
         frases = re.split(r"(?<=[\.\!\?])\s+", texto)
         topicos = [f.strip()[:80] for f in frases if len(f.strip()) > 20][:max_topicos]
     return topicos
@@ -372,12 +487,17 @@ def extrair_topicos(texto: str, max_topicos: int = 25):
 def gerar_flashcards_de_texto(texto: str, subject_id: int, limite: int = 15):
     """
     Gera flashcards automaticamente a partir do texto extraído.
-    Estratégia: quebra o texto em frases relevantes e cria pares
-    pergunta/resposta usando o tópico e a frase associada.
+    Estratégia: quebra o texto em frases, descarta ruído (cabeçalho/rodapé/
+    marca d'água já foram removidos na extração) e mantém apenas frases com
+    conteúdo clínico reconhecível, criando pares pergunta/resposta a partir
+    delas. Retorna (quantidade_criada, quantidade_descartada_por_nao_medica).
     """
-    frases = [f.strip() for f in re.split(r"(?<=[\.\!\?])\s+", texto) if len(f.strip()) > 30]
+    candidatas = [f.strip() for f in re.split(r"(?<=[\.\!\?])\s+", texto) if len(f.strip()) > 30]
+    frases_medicas = [f for f in candidatas if not eh_ruido(f) and eh_conteudo_medico(f)]
+    descartadas = len(candidatas) - len(frases_medicas)
+
     criados = 0
-    for frase in frases:
+    for frase in frases_medicas:
         if criados >= limite:
             break
         palavras = frase.split()
@@ -392,16 +512,24 @@ def gerar_flashcards_de_texto(texto: str, subject_id: int, limite: int = 15):
             (subject_id, frente, verso, date.today().isoformat(), datetime.now().isoformat()),
         )
         criados += 1
-    return criados
+    return criados, descartadas
 
 
 def gerar_questoes_de_texto(texto: str, subject_id: int, limite: int = 10):
     """
     Gera questões de múltipla escolha (cloze) a partir do texto,
     ocultando uma palavra-chave da frase e criando distratores simples.
+    Apenas frases com conteúdo clínico reconhecível (após descarte de
+    ruído de cabeçalho/rodapé/marca d'água) entram como base das questões.
+    Retorna (quantidade_criada, quantidade_descartada_por_nao_medica).
     """
-    frases = [f.strip() for f in re.split(r"(?<=[\.\!\?])\s+", texto) if len(f.strip()) > 40]
+    candidatas = [f.strip() for f in re.split(r"(?<=[\.\!\?])\s+", texto) if len(f.strip()) > 40]
+    frases = [f for f in candidatas if not eh_ruido(f) and eh_conteudo_medico(f)]
+    descartadas = len(candidatas) - len(frases)
+
     criados = 0
+    # Banco de palavras-chave usado para gerar distratores plausíveis,
+    # extraído apenas das frases já filtradas como conteúdo médico
     banco_palavras = list({p.strip(".,;:()") for f in frases for p in f.split() if len(p) > 5})
 
     for frase in frases:
@@ -438,7 +566,7 @@ def gerar_questoes_de_texto(texto: str, subject_id: int, limite: int = 10):
             ),
         )
         criados += 1
-    return criados
+    return criados, descartadas
 
 
 # =============================================================================
@@ -715,27 +843,37 @@ elif pagina == "📅 Cronograma, Pesos e Ciclo":
 elif pagina == "📥 Importador de Editais/Materiais":
     st.title("📥 Importador de Editais e Materiais de Estudo")
     st.caption(
-        "Envie um PDF ou TXT. O sistema extrai os tópicos, sugere matérias para o "
-        "cronograma e gera automaticamente flashcards e questões baseados estritamente no material."
+        "Envie um PDF ou TXT. O sistema descarta automaticamente cabeçalhos, rodapés, "
+        "numeração de página, marcas d'água e avisos editoriais, extrai os tópicos e gera "
+        "flashcards e questões baseados estritamente no conteúdo médico essencial do material."
     )
 
     arquivo = st.file_uploader("Selecione o arquivo (PDF ou TXT)", type=["pdf", "txt"])
 
     if arquivo is not None:
-        with st.spinner("Lendo e processando o material..."):
-            texto_extraido = extrair_texto_arquivo(arquivo)
+        with st.spinner("Lendo, limpando e processando o material..."):
+            texto_extraido, stats_limpeza = extrair_texto_arquivo(arquivo)
 
         if not texto_extraido.strip():
             st.error("Não foi possível extrair texto do arquivo enviado.")
         else:
-            st.success(f"Arquivo processado! {len(texto_extraido)} caracteres extraídos.")
+            st.success(f"Arquivo processado! {len(texto_extraido)} caracteres úteis extraídos.")
+
+            if stats_limpeza.get("linhas_removidas", 0) > 0:
+                st.info(
+                    f"🧹 Limpeza automática: **{stats_limpeza['linhas_removidas']} linha(s)** de "
+                    f"cabeçalho/rodapé/numeração/marca d'água/aviso editorial foram descartadas "
+                    f"(de {stats_limpeza['linhas_antes']} linhas originais), mantendo "
+                    f"{stats_limpeza['linhas_depois']} linhas de conteúdo."
+                )
+
             topicos = extrair_topicos(texto_extraido)
 
             st.subheader("🗂️ Tópicos identificados no material")
             st.write(topicos if topicos else "Nenhum tópico claro identificado.")
 
-            with st.expander("👁️ Visualizar texto extraído (prévia)"):
-                st.text_area("Prévia do conteúdo", texto_extraido[:3000], height=200)
+            with st.expander("👁️ Visualizar texto já limpo (prévia)"):
+                st.text_area("Prévia do conteúdo pós-limpeza", texto_extraido[:3000], height=200)
 
             st.divider()
             st.subheader("⚙️ Associar conteúdo a uma matéria")
@@ -772,14 +910,26 @@ elif pagina == "📥 Importador de Editais/Materiais":
                 else:
                     subject_id = int(subjects_df.loc[subjects_df["name"] == escolha, "id"].values[0])
 
-                with st.spinner("Gerando conteúdo de estudo a partir do material..."):
-                    n_fc = gerar_flashcards_de_texto(texto_extraido, int(subject_id), qtd_flashcards)
-                    n_q = gerar_questoes_de_texto(texto_extraido, int(subject_id), qtd_questoes)
+                with st.spinner("Filtrando conteúdo médico e gerando material de estudo..."):
+                    n_fc, desc_fc = gerar_flashcards_de_texto(texto_extraido, int(subject_id), qtd_flashcards)
+                    n_q, desc_q = gerar_questoes_de_texto(texto_extraido, int(subject_id), qtd_questoes)
 
                 st.success(
-                    f"✅ Gerados {n_fc} flashcards e {n_q} questões, "
-                    f"vinculados estritamente ao conteúdo enviado!"
+                    f"✅ Gerados {n_fc} flashcards e {n_q} questões, baseados estritamente "
+                    f"no conteúdo médico essencial identificado no material."
                 )
+                total_descartado = desc_fc + desc_q
+                if total_descartado > 0:
+                    st.caption(
+                        f"🩺 {total_descartado} trecho(s) foram ignorados na geração por não "
+                        "representarem conteúdo clínico/médico reconhecível (ex: texto institucional, "
+                        "administrativo ou contextual não essencial)."
+                    )
+                if n_fc == 0 and n_q == 0:
+                    st.warning(
+                        "Nenhum trecho com vocabulário médico reconhecível foi encontrado neste "
+                        "material. Verifique se o arquivo enviado é, de fato, conteúdo clínico/médico."
+                    )
                 st.balloons()
 
 # =============================================================================

@@ -1953,18 +1953,13 @@ elif pagina == "🗂️ Planner de Estudos":
                 if dia == 0:
                     grid_html += "<td></td>"
                     continue
-                data_iso = f"{int(ano_planner)}-{int(mes_planner):02d}-{dia:02d}"
-                qtd = contagem_por_dia.get(data_iso, 0)
-                intensidade = min(1.0, qtd / 4) if qtd else 0
-                cor_fundo = f"rgba(91,141,239,{0.15 + intensidade * 0.5})" if qtd else "rgba(255,255,255,0.04)"
-                data_iso = f"{int(ano_planner)}-{int(mes_planner):02d}-{dia:02d}"
+               data_iso = f"{int(ano_planner)}-{int(mes_planner):02d}-{dia:02d}"
         qtd = contagem_por_dia.get(data_iso, 0)
         intensidade = min(1.0, qtd / 4) if qtd else 0
         cor_fundo = f"rgba(91,141,239,{0.15 + intensidade * 0.5})" if qtd else "transparent"
         html_interno = f"<br><span style='font-size:0.7rem'>{qtd}</span>" if qtd else ""
         
         grid_html += f"<td style='background:{cor_fundo}; border-radius:10px; padding:5px; text-align:center;'>{dia}{html_interno}</td>"
-1968        )
                 )
             grid_html += "</tr>"
         grid_html += "</table>"

@@ -12,11 +12,15 @@ Aplicativo completo em Streamlit para gestão de estudos com:
 - Relatórios semanais e curva de esquecimento de Ebbinghaus
 
 Autor: Engenharia de Software Educacional
-Banco de dados: SQLite local (cronomody.db)
+Banco de dados: Neon (PostgreSQL na nuvem) - sincronizado entre dispositivos
 """
 
 import streamlit as st
-import sqlite3
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -25,8 +29,11 @@ from datetime import datetime, date, timedelta
 import json
 import random
 import time
+import os
 import re
 import io
+import base64
+import calendar as calendar_lib
 
 # Extração de PDF (pypdf é o sucessor mantido do PyPDF2)
 try:
@@ -70,7 +77,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "cronomody.db"
+def obter_dsn_neon() -> str:
+    """
+    Obtém a string de conexão do banco Neon (Postgres), na ordem:
+    1) st.secrets["NEON_DATABASE_URL"] (recomendado - .streamlit/secrets.toml ou secrets do host)
+    2) variável de ambiente NEON_DATABASE_URL ou DATABASE_URL
+    Formato esperado (fornecido pelo painel do Neon):
+    postgresql://usuario:senha@ep-xxxxx.us-east-2.aws.neon.tech/nomedobanco?sslmode=require
+    """
+    try:
+        if "NEON_DATABASE_URL" in st.secrets:
+            return st.secrets["NEON_DATABASE_URL"]
+    except Exception:
+        pass
+    return os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
 
 # =============================================================================
 # SISTEMA DE TEMAS DINÂMICOS (paleta de cores selecionável pelo usuário)
@@ -217,16 +237,46 @@ h1, h2, h3 {{ letter-spacing: -0.01em; }}
 """
 
 # =============================================================================
-# CAMADA DE BANCO DE DADOS (SQLite)
+# CAMADA DE BANCO DE DADOS (Neon - PostgreSQL na nuvem)
 # =============================================================================
+# Trocamos o SQLite local por um banco Postgres hospedado no Neon, garantindo
+# que os dados do usuário (cursos, matérias, flashcards, questões, decks,
+# provas, cronogramas, métricas) sejam sincronizados entre dispositivos: o
+# mesmo login acessa os mesmos dados de qualquer navegador/computador/celular,
+# pois tudo fica em um único banco na nuvem em vez de um arquivo local.
+
+
+@st.cache_resource(show_spinner=False)
+def obter_conexao_streamlit():
+    """
+    Cria (uma única vez por processo do servidor) a conexão gerenciada pelo
+    Streamlit via st.connection("sql", ...), que usa SQLAlchemy por baixo dos
+    panos e mantém um pool de conexões reaproveitáveis com o Neon - evitando
+    o custo de abrir uma conexão TCP/TLS nova a cada consulta.
+    """
+    dsn = obter_dsn_neon()
+    if not dsn:
+        st.error(
+            "🔌 Não foi possível conectar ao banco de dados Neon: nenhuma string de conexão "
+            "encontrada. Configure `NEON_DATABASE_URL` em `.streamlit/secrets.toml` (ou como "
+            "variável de ambiente) com a Connection String fornecida pelo painel do Neon "
+            "(Dashboard → Connection Details), no formato:\n\n"
+            "`postgresql://usuario:senha@ep-xxxxx-pooler.regiao.aws.neon.tech/nomedobanco?sslmode=require`"
+        )
+        st.stop()
+    return st.connection("neon_db", type="sql", url=dsn)
 
 
 def get_conn():
-    """Retorna uma conexão SQLite com row_factory configurado."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    """
+    Obtém uma conexão psycopg2 "crua" a partir do pool gerenciado pelo
+    st.connection (via SQLAlchemy). O restante do app (run_query/df_query)
+    continua usando a mesma API psycopg2 de sempre - só a origem da conexão
+    mudou, então fechar essa conexão (conn.close()) devolve-a ao pool em vez
+    de encerrar a conexão TCP, que é reaproveitada na próxima consulta.
+    """
+    conexao_streamlit = obter_conexao_streamlit()
+    return conexao_streamlit.engine.raw_connection()
 
 
 def init_db():
@@ -234,17 +284,27 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.executescript(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
-            created_at TEXT
+            created_at TEXT,
+            is_active BOOLEAN DEFAULT TRUE,
+            is_admin BOOLEAN DEFAULT FALSE,
+            display_name TEXT,
+            foto_perfil TEXT,
+            xp INTEGER DEFAULT 0,
+            nivel INTEGER DEFAULT 1,
+            streak INTEGER DEFAULT 0,
+            ultimo_login TEXT,
+            status_atual TEXT DEFAULT '',
+            ultimo_visto TEXT
         );
 
         CREATE TABLE IF NOT EXISTS courses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER,
             name TEXT NOT NULL,
             exam_date TEXT,
@@ -254,7 +314,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS subjects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             course_id INTEGER,
             name TEXT NOT NULL,
             importance INTEGER DEFAULT 3,
@@ -263,12 +323,12 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS flashcards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             subject_id INTEGER,
             front TEXT NOT NULL,
             back TEXT NOT NULL,
             ease REAL DEFAULT 2.5,
-            interval REAL DEFAULT 0,
+            review_interval REAL DEFAULT 0,
             repetitions INTEGER DEFAULT 0,
             due_date TEXT,
             last_review TEXT,
@@ -278,7 +338,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             subject_id INTEGER,
             statement TEXT NOT NULL,
             option_a TEXT, option_b TEXT, option_c TEXT, option_d TEXT, option_e TEXT,
@@ -291,7 +351,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS question_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             question_id INTEGER,
             subject_id INTEGER,
             is_correct INTEGER,
@@ -300,7 +360,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS flashcard_reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             flashcard_id INTEGER,
             quality INTEGER,
             timestamp TEXT,
@@ -308,7 +368,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS study_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             log_date TEXT,
             subject_id INTEGER,
             minutes REAL,
@@ -323,7 +383,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS decks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             subject_id INTEGER,
             name TEXT NOT NULL,
             topic TEXT,
@@ -333,7 +393,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS exams (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             course_id INTEGER,
             name TEXT NOT NULL,
             exam_date TEXT,
@@ -350,14 +410,59 @@ def init_db():
             theme TEXT DEFAULT 'Vermelho Bordô (Padrão)',
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            title TEXT NOT NULL,
+            description TEXT,
+            subject_name TEXT,
+            task_date TEXT,
+            status TEXT DEFAULT 'pendente',
+            created_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_logs (
+            user_id INTEGER,
+            log_date TEXT,
+            agua_copos INTEGER DEFAULT 0,
+            humor TEXT,
+            notas TEXT DEFAULT '',
+            observacoes TEXT DEFAULT '',
+            PRIMARY KEY (user_id, log_date),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS monthly_notes (
+            user_id INTEGER,
+            year_month TEXT,
+            atencao_especial TEXT DEFAULT '',
+            PRIMARY KEY (user_id, year_month),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS timeline_blocks (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            block_date TEXT,
+            start_time TEXT,
+            end_time TEXT,
+            subject_name TEXT,
+            created_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
     conn.commit()
 
     # ---- Migrações leves: adiciona colunas novas em bancos já existentes ----
     def garantir_coluna(tabela, coluna, definicao):
-        cols = [r[1] for r in cur.execute(f"PRAGMA table_info({tabela})").fetchall()]
-        if coluna not in cols:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND column_name = %s",
+            (tabela, coluna),
+        )
+        if cur.fetchone() is None:
             cur.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {definicao}")
 
     garantir_coluna("flashcards", "deck_id", "INTEGER")
@@ -365,22 +470,46 @@ def init_db():
     garantir_coluna("questions", "banca", "TEXT")
     garantir_coluna("questions", "dificuldade", "TEXT DEFAULT 'Médio'")
     garantir_coluna("courses", "user_id", "INTEGER")
+    garantir_coluna("users", "is_active", "BOOLEAN DEFAULT TRUE")
+    garantir_coluna("users", "is_admin", "BOOLEAN DEFAULT FALSE")
+    garantir_coluna("users", "display_name", "TEXT")
+    garantir_coluna("users", "foto_perfil", "TEXT")
+    garantir_coluna("users", "xp", "INTEGER DEFAULT 0")
+    garantir_coluna("users", "nivel", "INTEGER DEFAULT 1")
+    garantir_coluna("users", "streak", "INTEGER DEFAULT 0")
+    garantir_coluna("users", "ultimo_login", "TEXT")
+    garantir_coluna("users", "status_atual", "TEXT DEFAULT ''")
+    garantir_coluna("users", "ultimo_visto", "TEXT")
     conn.commit()
     conn.close()
 
 
+def _adaptar_placeholders(query: str) -> str:
+    """
+    Converte os placeholders '?' (estilo SQLite, usados em todo o código do app)
+    para '%s' (estilo psycopg2/Postgres), sem precisar reescrever cada chamada
+    individual espalhada pelo app. Seguro aqui porque nenhuma query deste app
+    usa literalmente o caractere '?' fora de placeholders de parâmetro.
+    """
+    return query.replace("?", "%s")
+
+
 def run_query(query, params=(), fetch=False, many=False):
-    """Executa uma query genérica com tratamento de erros."""
+    """Executa uma query de escrita (INSERT/UPDATE/DELETE) com tratamento de erros."""
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute(query, params)
+        cur.execute(_adaptar_placeholders(query), params)
         result = None
         if fetch:
             result = cur.fetchall() if many else cur.fetchone()
         conn.commit()
         return result
-    except sqlite3.Error as e:
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        raise  # deixa o chamador tratar violações de unicidade (ex: nome duplicado)
+    except psycopg2.Error as e:
+        conn.rollback()
         st.error(f"Erro no banco de dados: {e}")
         return None
     finally:
@@ -388,17 +517,25 @@ def run_query(query, params=(), fetch=False, many=False):
 
 
 def df_query(query, params=()):
-    """Executa uma query e retorna um DataFrame do pandas."""
+    """Executa uma query de leitura (SELECT) e retorna um DataFrame do pandas."""
     conn = get_conn()
     try:
-        df = pd.read_sql_query(query, conn, params=params)
+        df = pd.read_sql_query(_adaptar_placeholders(query), conn, params=params)
     except Exception as e:
+        conn.rollback()
         st.error(f"Erro ao consultar dados: {e}")
         df = pd.DataFrame()
     finally:
         conn.close()
     return df
 
+
+if psycopg2 is None:
+    st.error(
+        "🔌 A biblioteca `psycopg2` (driver do Postgres/Neon) não está instalada. "
+        "Rode `pip install psycopg2-binary` e reinicie o app."
+    )
+    st.stop()
 
 init_db()
 
@@ -419,12 +556,70 @@ if bcrypt is None:
 # (nunca em texto puro). A sessão ativa (st.session_state.auth_user_id)
 # mantém o usuário logado enquanto ele navega pelas abas do app.
 #
-# Observação de arquitetura: este banco SQLite é um arquivo local ao servidor
-# que roda o Streamlit. O isolamento de dados por usuário funciona plenamente
-# aqui; para acesso multi-dispositivo/multi-servidor "na nuvem" de fato, basta
-# trocar a camada get_conn()/DB_PATH por um driver de um banco hospedado
-# (ex: Postgres) - o restante da lógica de autenticação e escopo por
-# user_id permanece o mesmo.
+# Observação de arquitetura: o banco agora é o Neon (Postgres hospedado na
+# nuvem), então o isolamento por user_id garante tanto que um usuário nunca
+# veja dados de outro QUANTO sincronização automática entre dispositivos -
+# o mesmo login em qualquer navegador/computador/celular aponta para o mesmo
+# banco na nuvem, sem depender de um arquivo local a um servidor específico.
+
+def calcular_nivel(xp: int) -> int:
+    """Nível sobe a cada 100 XP acumulados (nível 1 = 0-99 XP, nível 2 = 100-199 XP, ...)."""
+    return max(1, int(xp // 100) + 1)
+
+
+def conceder_xp(user_id: int, quantidade: int):
+    """
+    Concede XP a um usuário por uma ação relevante (revisão de flashcard,
+    questão respondida, pomodoro concluído, etc.), recalcula o nível e
+    retorna (subiu_de_nivel, novo_nivel) para a interface poder comemorar
+    com st.balloons() quando apropriado.
+    """
+    usuario_atual = df_query("SELECT xp, nivel FROM users WHERE id = ?", (user_id,))
+    if usuario_atual.empty:
+        return False, 1
+    xp_antigo = int(usuario_atual.iloc[0]["xp"] or 0)
+    nivel_antigo = int(usuario_atual.iloc[0]["nivel"] or 1)
+    novo_xp = xp_antigo + quantidade
+    novo_nivel = calcular_nivel(novo_xp)
+    run_query("UPDATE users SET xp = ?, nivel = ? WHERE id = ?", (novo_xp, novo_nivel, user_id))
+    return novo_nivel > nivel_antigo, novo_nivel
+
+
+def atualizar_streak_login(user_id: int):
+    """
+    Atualiza a ofensiva (dias consecutivos de acesso): incrementa se o último
+    login foi ontem, reinicia para 1 se pulou um ou mais dias, e mantém se já
+    logou hoje. Também atualiza ultimo_login e ultimo_visto.
+    """
+    usuario_atual = df_query("SELECT ultimo_login, streak FROM users WHERE id = ?", (user_id,))
+    hoje = date.today()
+    streak_atual = int(usuario_atual.iloc[0]["streak"] or 0) if not usuario_atual.empty else 0
+    ultimo_login_str = usuario_atual.iloc[0]["ultimo_login"] if not usuario_atual.empty else None
+
+    if ultimo_login_str:
+        try:
+            ultimo_login_data = datetime.fromisoformat(ultimo_login_str).date()
+        except ValueError:
+            ultimo_login_data = None
+        if ultimo_login_data == hoje:
+            pass  # já logou hoje, mantém a ofensiva como está
+        elif ultimo_login_data == hoje - timedelta(days=1):
+            streak_atual += 1
+        else:
+            streak_atual = 1
+    else:
+        streak_atual = 1
+
+    run_query(
+        "UPDATE users SET streak = ?, ultimo_login = ?, ultimo_visto = ? WHERE id = ?",
+        (streak_atual, datetime.now().isoformat(), datetime.now().isoformat(), user_id),
+    )
+
+
+def atualizar_ultimo_visto(user_id: int):
+    """'Heartbeat' de presença: chamado a cada carregamento de página para alimentar a Comunidade."""
+    run_query("UPDATE users SET ultimo_visto = ? WHERE id = ?", (datetime.now().isoformat(), user_id))
+
 
 def criar_usuario(username: str, password: str):
     """Cria um novo usuário com senha protegida por hash bcrypt. Retorna (sucesso, mensagem)."""
@@ -434,18 +629,24 @@ def criar_usuario(username: str, password: str):
     if len(password) < 6:
         return False, "A senha deve ter ao menos 6 caracteres."
     hash_senha = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    # O primeiro usuário do sistema (ou o e-mail configurado abaixo) vira admin automaticamente
+    total_usuarios = df_query("SELECT COUNT(*) as c FROM users").iloc[0]["c"]
+    eh_admin_inicial = int(total_usuarios) == 0 or username.lower() == "giomodolont@gmail.com"
+
     try:
         run_query(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-            (username, hash_senha, datetime.now().isoformat()),
+            "INSERT INTO users (username, password_hash, created_at, is_active, is_admin, display_name) "
+            "VALUES (?, ?, ?, TRUE, ?, ?)",
+            (username, hash_senha, datetime.now().isoformat(), eh_admin_inicial, username),
         )
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False, "Esse nome de usuário já está em uso."
     usuario = df_query("SELECT id FROM users WHERE username = ?", (username,))
     novo_id = int(usuario.iloc[0]["id"])
     # Cria as configurações e o curso inicial deste novo usuário
     run_query(
-        "INSERT OR IGNORE INTO app_settings (user_id, user_name, theme) VALUES (?, ?, ?)",
+        "INSERT INTO app_settings (user_id, user_name, theme) VALUES (?, ?, ?) ON CONFLICT (user_id) DO NOTHING",
         (novo_id, username, TEMA_PADRAO),
     )
     run_query(
@@ -456,19 +657,26 @@ def criar_usuario(username: str, password: str):
 
 
 def verificar_login(username: str, password: str):
-    """Verifica usuário/senha comparando o hash bcrypt. Retorna (sucesso, user_id ou mensagem)."""
+    """Verifica usuário/senha e status da conta. Retorna (sucesso, user_id ou mensagem)."""
     usuario = df_query("SELECT * FROM users WHERE username = ?", (username.strip(),))
     if usuario.empty:
         return False, "Usuário não encontrado."
-    hash_salvo = usuario.iloc[0]["password_hash"].encode("utf-8")
-    if bcrypt.checkpw(password.encode("utf-8"), hash_salvo):
-        return True, int(usuario.iloc[0]["id"])
-    return False, "Senha incorreta."
+    linha = usuario.iloc[0]
+    hash_salvo = linha["password_hash"].encode("utf-8")
+    if not bcrypt.checkpw(password.encode("utf-8"), hash_salvo):
+        return False, "Senha incorreta."
+    if not bool(linha["is_active"]):
+        return False, "🚫 Esta conta está suspensa. Entre em contato com um administrador."
+    user_id = int(linha["id"])
+    atualizar_streak_login(user_id)
+    return True, user_id
 
 
 # ---- Tela de Login / Criar Conta (exibida antes de qualquer outra tela) ----
 if "auth_user_id" not in st.session_state:
     st.session_state.auth_user_id = None
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
 
 if st.session_state.auth_user_id is None:
     st.markdown(
@@ -488,6 +696,8 @@ if st.session_state.auth_user_id is None:
             ok, resultado = verificar_login(login_user, login_pass)
             if ok:
                 st.session_state.auth_user_id = resultado
+                dados_login = df_query("SELECT is_admin FROM users WHERE id = ?", (resultado,))
+                st.session_state.is_admin = bool(dados_login.iloc[0]["is_admin"]) if not dados_login.empty else False
                 st.rerun()
             else:
                 st.error(resultado)
@@ -511,6 +721,7 @@ if st.session_state.auth_user_id is None:
     st.stop()  # Bloqueia o restante do app até que o login seja concluído
 
 USER_ID = st.session_state.auth_user_id
+atualizar_ultimo_visto(USER_ID)  # heartbeat de presença para a Comunidade
 
 # Aplica o tema visual escolhido pelo usuário logado (lido do app_settings)
 config_usuario = df_query("SELECT * FROM app_settings WHERE user_id = ?", (USER_ID,))
@@ -706,6 +917,84 @@ def registrar_estudo(subject_id, minutos, tipo):
     )
 
 
+def gerar_link_google_calendar(titulo: str, data_iso: str, descricao: str = "", local: str = "") -> str:
+    """
+    Gera um link de 'Adicionar evento' do Google Agenda (sem precisar de OAuth/credenciais -
+    basta o usuário estar logado no Google no navegador). Cobre a integração com Google Agenda
+    pedida para provas e tarefas do Planner; uma sincronização bidirecional automática exigiria
+    configurar OAuth2 no Google Cloud Console, que é um passo à parte a critério do usuário.
+    """
+    data_obj = datetime.fromisoformat(data_iso)
+    data_gcal = data_obj.strftime("%Y%m%d")
+    data_gcal_fim = (data_obj + timedelta(days=1)).strftime("%Y%m%d")
+    return (
+        "https://calendar.google.com/calendar/render?action=TEMPLATE"
+        f"&text={titulo.replace(' ', '+')}"
+        f"&dates={data_gcal}/{data_gcal_fim}"
+        f"&details={descricao.replace(' ', '+')}"
+        f"&location={local.replace(' ', '+')}"
+    )
+
+
+# ---- Planner de Estudos: helpers de daily_logs, notas mensais e tarefas ---
+STATUS_TAREFA_CORES = {
+    "concluido": "#4C9A4C",
+    "andamento": "#D4B62C",
+    "pendente": "#E07A2C",
+    "atrasado": "#D14848",
+    "importante": "#8E5FD6",
+}
+STATUS_TAREFA_LABELS = {
+    "concluido": "✅ Concluído",
+    "andamento": "🟡 Em andamento",
+    "pendente": "🟠 Pendente",
+    "atrasado": "🔴 Atrasado",
+    "importante": "🟣 Importante",
+}
+
+
+def obter_daily_log(user_id: int, log_date_str: str):
+    """Retorna (criando se necessário) o registro diário de água/humor/notas do usuário para a data."""
+    df = df_query("SELECT * FROM daily_logs WHERE user_id = ? AND log_date = ?", (user_id, log_date_str))
+    if df.empty:
+        run_query(
+            """INSERT INTO daily_logs (user_id, log_date, agua_copos, humor, notas, observacoes)
+               VALUES (?, ?, 0, '', '', '') ON CONFLICT (user_id, log_date) DO NOTHING""",
+            (user_id, log_date_str),
+        )
+        df = df_query("SELECT * FROM daily_logs WHERE user_id = ? AND log_date = ?", (user_id, log_date_str))
+    return df.iloc[0]
+
+
+def atualizar_daily_log_campo(user_id: int, log_date_str: str, campo: str, valor):
+    """Atualiza um único campo do daily_log (água, humor, notas ou observações), garantindo que a linha exista."""
+    obter_daily_log(user_id, log_date_str)
+    colunas_permitidas = {"agua_copos", "humor", "notas", "observacoes"}
+    if campo not in colunas_permitidas:
+        return
+    run_query(
+        f"UPDATE daily_logs SET {campo} = ? WHERE user_id = ? AND log_date = ?",
+        (valor, user_id, log_date_str),
+    )
+
+
+def obter_nota_mensal(user_id: int, year_month: str) -> str:
+    """Retorna o texto de 'atenção especial' do mês (tópicos/matérias para reforçar)."""
+    df = df_query(
+        "SELECT atencao_especial FROM monthly_notes WHERE user_id = ? AND year_month = ?",
+        (user_id, year_month),
+    )
+    return df.iloc[0]["atencao_especial"] if not df.empty else ""
+
+
+def salvar_nota_mensal(user_id: int, year_month: str, texto: str):
+    run_query(
+        """INSERT INTO monthly_notes (user_id, year_month, atencao_especial) VALUES (?, ?, ?)
+           ON CONFLICT (user_id, year_month) DO UPDATE SET atencao_especial = excluded.atencao_especial""",
+        (user_id, year_month, texto),
+    )
+
+
 # ---- Filtros de limpeza para materiais médicos (remoção de ruído) ---------
 # Padrões típicos de cabeçalho/rodapé/marca d'água/avisos legais em apostilas e livros
 PADROES_RUIDO = [
@@ -893,7 +1182,7 @@ def gerar_flashcards_de_texto(texto: str, subject_id: int, limite: int = 15, dec
         verso = frase
         run_query(
             """INSERT INTO flashcards
-               (subject_id, front, back, ease, interval, repetitions, due_date, last_review, created_at, source, deck_id)
+               (subject_id, front, back, ease, review_interval, repetitions, due_date, last_review, created_at, source, deck_id)
                VALUES (?, ?, ?, 2.5, 0, 0, ?, NULL, ?, 'importado', ?)""",
             (subject_id, frente, verso, date.today().isoformat(), datetime.now().isoformat(), deck_id),
         )
@@ -1113,7 +1402,7 @@ TRECHO:
                 continue
             run_query(
                 """INSERT INTO flashcards
-                   (subject_id, front, back, ease, interval, repetitions, due_date, last_review, created_at, source, deck_id)
+                   (subject_id, front, back, ease, review_interval, repetitions, due_date, last_review, created_at, source, deck_id)
                    VALUES (?, ?, ?, 2.5, 0, 0, ?, NULL, ?, 'ia', ?)""",
                 (subject_id, frente, verso, date.today().isoformat(), datetime.now().isoformat(), deck_id),
             )
@@ -1227,11 +1516,12 @@ Responda em JSON no formato:
         subject_id = mapa_subject_ids.get(materia_da_questao) or list(mapa_subject_ids.values())[0]
         if not q.get("statement") or not q.get("correct_option"):
             continue
-        run_query(
+        resultado_insert = run_query(
             """INSERT INTO questions
                (subject_id, statement, option_a, option_b, option_c, option_d, option_e,
                 correct_option, explanation, priority, created_at, source, topic, banca, dificuldade)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, 'ia_simulado', ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, 'ia_simulado', ?, ?, ?)
+               RETURNING id""",
             (
                 subject_id, q.get("statement", ""),
                 q.get("option_a", ""), q.get("option_b", ""), q.get("option_c", ""),
@@ -1240,9 +1530,10 @@ Responda em JSON no formato:
                 q.get("explanation", ""), datetime.now().isoformat(),
                 q.get("topic"), bancas_texto, dificuldade,
             ),
+            fetch=True,
         )
-        novo_id = df_query("SELECT last_insert_rowid() as id").iloc[0]["id"]
-        ids_criados.append(int(novo_id))
+        if resultado_insert:
+            ids_criados.append(int(resultado_insert[0]))
     return ids_criados
 
 
@@ -1317,6 +1608,52 @@ def render_heatmap_constancia(user_id: int):
 st.sidebar.title("⏱️ CRONOMODY")
 st.sidebar.caption("Sua plataforma de alta performance nos estudos")
 
+# ---- Gamificação: XP, nível e ofensiva (sempre visíveis) ----
+dados_gamificacao = df_query(
+    "SELECT xp, nivel, streak, display_name, foto_perfil, status_atual FROM users WHERE id = ?", (USER_ID,)
+)
+xp_atual = int(dados_gamificacao.iloc[0]["xp"] or 0) if not dados_gamificacao.empty else 0
+nivel_atual = int(dados_gamificacao.iloc[0]["nivel"] or 1) if not dados_gamificacao.empty else 1
+streak_atual = int(dados_gamificacao.iloc[0]["streak"] or 0) if not dados_gamificacao.empty else 0
+
+xp_base_nivel = (nivel_atual - 1) * 100
+progresso_nivel = min(1.0, max(0.0, (xp_atual - xp_base_nivel) / 100))
+st.sidebar.caption(f"🏅 Nível {nivel_atual} · {xp_atual} XP")
+st.sidebar.progress(progresso_nivel, text=f"{int(progresso_nivel * 100)}% para o nível {nivel_atual + 1}")
+st.sidebar.markdown(
+    f'<span class="cm-badge">🔥 Ofensiva: {streak_atual} dia(s)</span>', unsafe_allow_html=True
+)
+
+# ---- Comunidade: usuários ativos nos últimos 5 minutos ----
+with st.sidebar.expander("👥 Comunidade"):
+    limite_online = (datetime.now() - timedelta(minutes=5)).isoformat()
+    usuarios_ativos = df_query(
+        """SELECT username, display_name, foto_perfil, status_atual, ultimo_visto FROM users
+           WHERE ultimo_visto >= ? AND id != ? ORDER BY ultimo_visto DESC LIMIT 15""",
+        (limite_online, USER_ID),
+    )
+    if usuarios_ativos.empty:
+        st.caption("Nenhum outro colega online agora.")
+    else:
+        for _, u in usuarios_ativos.iterrows():
+            nome_exibicao = u["display_name"] or u["username"]
+            status_txt = u["status_atual"] or "sem status definido"
+            st.markdown(
+                f"""<div class="cm-card" style="padding:8px 12px;">
+                        🟢 <b>{nome_exibicao}</b><br>
+                        <span style="color:var(--cm-text-muted); font-size:0.8rem">{status_txt}</span>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+    status_atual_valor = dados_gamificacao.iloc[0]["status_atual"] if not dados_gamificacao.empty else ""
+    novo_status = st.text_input("Seu status atual", value=status_atual_valor or "", placeholder="Ex: Estudando Cardiologia")
+    if st.button("Atualizar status"):
+        run_query("UPDATE users SET status_atual = ? WHERE id = ?", (novo_status.strip(), USER_ID))
+        st.success("Status atualizado!")
+        st.rerun()
+
 config_usuario = df_query("SELECT * FROM app_settings WHERE user_id = ?", (USER_ID,))
 nome_usuario_atual = config_usuario.iloc[0]["user_name"] if not config_usuario.empty else "Estudante"
 
@@ -1333,10 +1670,12 @@ with st.sidebar.expander("👤 Perfil"):
         )
         st.success("Perfil atualizado!")
         st.rerun()
+    st.caption("Para alterar nome de exibição, foto e status, veja a página '🙋 Meu Perfil'.")
     st.divider()
     if st.button("🚪 Sair (logout)"):
         st.session_state.auth_user_id = None
         st.session_state.active_course_id = None
+        st.session_state.is_admin = False
         st.rerun()
 
 cursos_df = df_query("SELECT * FROM courses WHERE user_id = ?", (USER_ID,))
@@ -1363,7 +1702,7 @@ with st.sidebar.expander("📚 Modo Multi Cursos", expanded=False):
                 )
                 st.success(f"Curso '{novo_curso_nome}' criado!")
                 st.rerun()
-            except sqlite3.IntegrityError:
+            except psycopg2.IntegrityError:
                 st.warning("Você já tem um curso com esse nome.")
         else:
             st.warning("Digite um nome válido para o curso.")
@@ -1382,7 +1721,7 @@ with st.sidebar.expander("📚 Modo Multi Cursos", expanded=False):
                 )
                 st.success("Nome atualizado!")
                 st.rerun()
-            except sqlite3.IntegrityError:
+            except psycopg2.IntegrityError:
                 st.warning("Você já tem um curso com esse nome.")
         else:
             st.warning("Nome não pode ficar vazio.")
@@ -1422,20 +1761,24 @@ if st.session_state.active_course_id not in ids_cursos:
 
 curso_atual = cursos_df[cursos_df["id"] == st.session_state.active_course_id].iloc[0]
 
-pagina = st.sidebar.radio(
-    "Navegação",
-    [
-        "🏠 Dashboard",
-        "📅 Cronograma, Pesos e Ciclo",
-        "🗓️ Provas e Calendário",
-        "📥 Importador de Editais/Materiais",
-        "🎴 Flashcards (SM-2)",
-        "❓ Simulador de Questões",
-        "🧪 Gerador de Simulados (IA)",
-        "🍅 Pomodoro",
-        "📊 Relatórios e Ebbinghaus",
-    ],
-)
+opcoes_navegacao = [
+    "🏠 Dashboard",
+    "🗂️ Planner de Estudos",
+    "📅 Cronograma, Pesos e Ciclo",
+    "🗓️ Provas e Calendário",
+    "📥 Importador de Editais/Materiais",
+    "🎴 Flashcards (SM-2)",
+    "❓ Simulador de Questões",
+    "🧪 Gerador de Simulados (IA)",
+    "🍅 Pomodoro",
+    "📊 Relatórios e Ebbinghaus",
+    "🙋 Meu Perfil",
+    "🏆 Ranking",
+]
+if st.session_state.get("is_admin"):
+    opcoes_navegacao.append("🛡️ Painel Admin")
+
+pagina = st.sidebar.radio("Navegação", opcoes_navegacao)
 
 st.sidebar.divider()
 st.sidebar.caption(f"Curso ativo: **{curso_atual['name']}**")
@@ -1556,6 +1899,287 @@ if pagina == "🏠 Dashboard":
                      color_continuous_scale="Blues", range_color=[0, 100])
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
+
+# =============================================================================
+# PÁGINA - PLANNER DE ESTUDOS (Mensal / Semanal / Anual)
+# =============================================================================
+elif pagina == "🗂️ Planner de Estudos":
+    st.title("🗂️ Planner de Estudos")
+
+    todas_tarefas = df_query("SELECT * FROM tasks WHERE user_id = ?", (USER_ID,))
+    total_tarefas = len(todas_tarefas)
+    concluidas = len(todas_tarefas[todas_tarefas["status"] == "concluido"]) if not todas_tarefas.empty else 0
+    pendentes = len(todas_tarefas[todas_tarefas["status"] == "pendente"]) if not todas_tarefas.empty else 0
+    atrasadas = len(todas_tarefas[todas_tarefas["status"] == "atrasado"]) if not todas_tarefas.empty else 0
+
+    cM1, cM2, cM3, cM4 = st.columns(4)
+    cM1.metric("📋 Total", total_tarefas)
+    cM2.metric("✅ Concluídas", concluidas)
+    cM3.metric("🟠 Pendentes", pendentes)
+    cM4.metric("🔴 Atrasadas", atrasadas)
+
+    st.divider()
+    aba_mensal, aba_semanal, aba_anual = st.tabs(["📅 Mensal", "🗓️ Semanal", "📆 Anual"])
+
+    # -----------------------------------------------------------------
+    # VISÃO MENSAL
+    # -----------------------------------------------------------------
+    with aba_mensal:
+        colM1, colM2 = st.columns(2)
+        mes_planner = colM1.selectbox(
+            "Mês", list(range(1, 13)), index=date.today().month - 1,
+            format_func=lambda m: ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho",
+                                    "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"][m - 1],
+            key="mes_planner",
+        )
+        ano_planner = colM2.number_input("Ano", min_value=2020, max_value=2100, value=date.today().year, step=1, key="ano_planner")
+        year_month_str = f"{int(ano_planner)}-{int(mes_planner):02d}"
+
+        tarefas_mes = df_query(
+            "SELECT * FROM tasks WHERE user_id = ? AND task_date LIKE ?", (USER_ID, f"{year_month_str}-%")
+        )
+        contagem_por_dia = tarefas_mes.groupby("task_date").size().to_dict() if not tarefas_mes.empty else {}
+
+        cal = calendar_lib.Calendar(firstweekday=0)
+        semanas_mes = cal.monthdayscalendar(int(ano_planner), int(mes_planner))
+        grid_html = "<table style='width:100%; border-collapse:separate; border-spacing:6px;'>"
+        grid_html += "<tr>" + "".join(
+            f"<th style='color:var(--cm-text-muted);font-weight:500;font-size:0.8rem'>{d}</th>"
+            for d in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+        ) + "</tr>"
+        for semana in semanas_mes:
+            grid_html += "<tr>"
+            for dia in semana:
+                if dia == 0:
+                    grid_html += "<td></td>"
+                    continue
+                data_iso = f"{int(ano_planner)}-{int(mes_planner):02d}-{dia:02d}"
+                qtd = contagem_por_dia.get(data_iso, 0)
+                intensidade = min(1.0, qtd / 4) if qtd else 0
+                cor_fundo = f"rgba(91,141,239,{0.15 + intensidade * 0.5})" if qtd else "rgba(255,255,255,0.04)"
+                grid_html += (
+                    f"<td style='background:{cor_fundo}; border-radius:10px; text-align:center; "
+                    f"padding:10px 4px; color:var(--cm-text-main); font-size:0.85rem'>{dia}"
+                    f"{f'<br><span style=\"font-size:0.7rem\">{qtd} tarefa(s)</span>' if qtd else ''}</td>"
+                )
+            grid_html += "</tr>"
+        grid_html += "</table>"
+        st.markdown(grid_html, unsafe_allow_html=True)
+
+        st.divider()
+        st.subheader("✅ Checklist diário de matérias")
+        data_checklist = st.date_input(
+            "Selecione o dia para o checklist", value=date.today(),
+            min_value=date(int(ano_planner), int(mes_planner), 1), key="data_checklist_mensal",
+        )
+        data_checklist_str = data_checklist.isoformat()
+        subjects_planner = df_query("SELECT * FROM subjects WHERE course_id = ?", (int(curso_atual["id"]),))
+        tarefas_do_dia_checklist = df_query(
+            "SELECT * FROM tasks WHERE user_id = ? AND task_date = ?", (USER_ID, data_checklist_str)
+        )
+        materias_ja_com_tarefa = set(tarefas_do_dia_checklist["subject_name"].tolist()) if not tarefas_do_dia_checklist.empty else set()
+
+        if subjects_planner.empty:
+            st.caption("Cadastre matérias na aba Cronograma para usar o checklist diário.")
+        else:
+            for _, materia in subjects_planner.iterrows():
+                if materia["name"] in materias_ja_com_tarefa:
+                    tarefa_existente = tarefas_do_dia_checklist[tarefas_do_dia_checklist["subject_name"] == materia["name"]].iloc[0]
+                    marcado = st.checkbox(
+                        materia["name"], value=tarefa_existente["status"] == "concluido",
+                        key=f"chk_{materia['name']}_{data_checklist_str}",
+                    )
+                    novo_status_chk = "concluido" if marcado else "pendente"
+                    if novo_status_chk != tarefa_existente["status"]:
+                        run_query("UPDATE tasks SET status = ? WHERE id = ?", (novo_status_chk, int(tarefa_existente["id"])))
+                        st.rerun()
+                else:
+                    marcado = st.checkbox(materia["name"], value=False, key=f"chk_{materia['name']}_{data_checklist_str}")
+                    if marcado:
+                        run_query(
+                            """INSERT INTO tasks (user_id, title, subject_name, task_date, status, created_at)
+                               VALUES (?, ?, ?, ?, 'concluido', ?)""",
+                            (USER_ID, f"Estudar {materia['name']}", materia["name"], data_checklist_str, datetime.now().isoformat()),
+                        )
+                        st.rerun()
+
+        st.divider()
+        st.subheader("📝 Tópicos/Matérias para dar atenção especial este mês")
+        nota_mensal_atual = obter_nota_mensal(USER_ID, year_month_str)
+        nova_nota_mensal = st.text_area("Anotações do mês", value=nota_mensal_atual, height=100, key="nota_mensal_texto")
+        if st.button("💾 Salvar anotação do mês"):
+            salvar_nota_mensal(USER_ID, year_month_str, nova_nota_mensal)
+            st.success("Anotação salva!")
+
+    # -----------------------------------------------------------------
+    # VISÃO SEMANAL
+    # -----------------------------------------------------------------
+    with aba_semanal:
+        if "dia_selecionado_planner" not in st.session_state:
+            st.session_state.dia_selecionado_planner = date.today().isoformat()
+
+        col_dias, col_painel = st.columns([1, 3])
+        with col_dias:
+            hoje = date.today()
+            inicio_semana_atual = hoje - timedelta(days=hoje.weekday())
+            for i in range(7):
+                dia_card = inicio_semana_atual + timedelta(days=i)
+                nome_dia = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"][i]
+                rotulo = f"{nome_dia[:3]} {dia_card.day:02d}"
+                tipo_botao = "primary" if dia_card.isoformat() == st.session_state.dia_selecionado_planner else "secondary"
+                if st.button(rotulo, key=f"dia_card_{i}", type=tipo_botao, use_container_width=True):
+                    st.session_state.dia_selecionado_planner = dia_card.isoformat()
+                    st.rerun()
+
+        with col_painel:
+            data_sel = datetime.fromisoformat(st.session_state.dia_selecionado_planner).date()
+            nomes_dias_pt = ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira",
+                              "Sexta-feira", "Sábado", "Domingo"]
+            nomes_meses_pt = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho",
+                               "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+            semana_do_mes = (data_sel.day - 1) // 7 + 1
+            st.subheader(f"{nomes_dias_pt[data_sel.weekday()]}, {nomes_meses_pt[data_sel.month - 1]} / Semana {semana_do_mes}")
+
+            log_dia = obter_daily_log(USER_ID, data_sel.isoformat())
+
+            colH, colM = st.columns(2)
+            with colH:
+                st.markdown("**💧 Hidratação**")
+                colHa, colHb, colHc = st.columns([1, 1, 2])
+                agua_atual = int(log_dia["agua_copos"] or 0)
+                if colHa.button("➖", key="agua_menos"):
+                    atualizar_daily_log_campo(USER_ID, data_sel.isoformat(), "agua_copos", max(0, agua_atual - 1))
+                    st.rerun()
+                if colHb.button("➕", key="agua_mais"):
+                    atualizar_daily_log_campo(USER_ID, data_sel.isoformat(), "agua_copos", agua_atual + 1)
+                    st.rerun()
+                colHc.markdown(f"### {agua_atual} 🥤")
+            with colM:
+                st.markdown("**😊 Humor do dia**")
+                opcoes_humor = ["😄 Ótimo", "🙂 Bem", "😐 Neutro", "😕 Cansado", "😣 Estressado"]
+                humor_atual = log_dia["humor"] or opcoes_humor[2]
+                novo_humor = st.selectbox(
+                    "Humor", opcoes_humor, index=opcoes_humor.index(humor_atual) if humor_atual in opcoes_humor else 2,
+                    label_visibility="collapsed", key="humor_select",
+                )
+                if novo_humor != humor_atual:
+                    atualizar_daily_log_campo(USER_ID, data_sel.isoformat(), "humor", novo_humor)
+
+            st.divider()
+            st.markdown("**📌 Tarefas e cronograma de estudos do dia**")
+            tarefas_dia = df_query(
+                "SELECT * FROM tasks WHERE user_id = ? AND task_date = ? ORDER BY id", (USER_ID, data_sel.isoformat())
+            )
+            for _, tarefa in tarefas_dia.iterrows():
+                cor = STATUS_TAREFA_CORES.get(tarefa["status"], "#5B8DEF")
+                colT1, colT2, colT3, colT4 = st.columns([3, 1.3, 0.5, 0.5])
+                colT1.markdown(
+                    f"""<div class="cm-card" style="border-left:4px solid {cor}">
+                            <b>{tarefa['title']}</b><br>
+                            <span style="color:var(--cm-text-muted); font-size:0.8rem">{tarefa['subject_name'] or ''}</span>
+                        </div>""",
+                    unsafe_allow_html=True,
+                )
+                novo_status_tarefa = colT2.selectbox(
+                    "Status", list(STATUS_TAREFA_LABELS.keys()),
+                    index=list(STATUS_TAREFA_LABELS.keys()).index(tarefa["status"]) if tarefa["status"] in STATUS_TAREFA_LABELS else 2,
+                    format_func=lambda s: STATUS_TAREFA_LABELS[s], key=f"status_tarefa_{tarefa['id']}",
+                    label_visibility="collapsed",
+                )
+                if novo_status_tarefa != tarefa["status"]:
+                    run_query("UPDATE tasks SET status = ? WHERE id = ?", (novo_status_tarefa, int(tarefa["id"])))
+                    if novo_status_tarefa == "concluido":
+                        subiu_nivel, nivel_novo = conceder_xp(USER_ID, 10)
+                        if subiu_nivel:
+                            st.balloons()
+                    st.rerun()
+                url_gcal_tarefa = gerar_link_google_calendar(
+                    tarefa["title"], tarefa["task_date"], descricao=tarefa["subject_name"] or ""
+                )
+                colT3.link_button("📅", url_gcal_tarefa, use_container_width=True)
+                if colT4.button("🗑️", key=f"del_tarefa_{tarefa['id']}"):
+                    run_query("DELETE FROM tasks WHERE id = ?", (int(tarefa["id"]),))
+                    st.rerun()
+
+            with st.form(f"form_nova_tarefa_{data_sel.isoformat()}", clear_on_submit=True):
+                colNT1, colNT2 = st.columns([3, 1])
+                titulo_tarefa = colNT1.text_input("Nova tarefa")
+                materia_tarefa = colNT2.text_input("Matéria (opcional)")
+                add_tarefa = st.form_submit_button("➕ Adicionar tarefa")
+                if add_tarefa and titulo_tarefa.strip():
+                    run_query(
+                        """INSERT INTO tasks (user_id, title, subject_name, task_date, status, created_at)
+                           VALUES (?, ?, ?, ?, 'pendente', ?)""",
+                        (USER_ID, titulo_tarefa.strip(), materia_tarefa.strip(), data_sel.isoformat(), datetime.now().isoformat()),
+                    )
+                    st.rerun()
+
+            st.divider()
+            st.markdown("**⏱️ Linha do tempo de estudos**")
+            blocos_dia = df_query(
+                "SELECT * FROM timeline_blocks WHERE user_id = ? AND block_date = ? ORDER BY start_time",
+                (USER_ID, data_sel.isoformat()),
+            )
+            for _, bloco in blocos_dia.iterrows():
+                colB1, colB2 = st.columns([4, 0.6])
+                colB1.markdown(f"🕐 **{bloco['start_time']} – {bloco['end_time']}** · {bloco['subject_name']}")
+                if colB2.button("🗑️", key=f"del_bloco_{bloco['id']}"):
+                    run_query("DELETE FROM timeline_blocks WHERE id = ?", (int(bloco["id"]),))
+                    st.rerun()
+            with st.form(f"form_novo_bloco_{data_sel.isoformat()}", clear_on_submit=True):
+                colBT1, colBT2, colBT3 = st.columns(3)
+                hora_ini = colBT1.time_input("Início")
+                hora_fim = colBT2.time_input("Fim")
+                materia_bloco = colBT3.text_input("Matéria")
+                add_bloco = st.form_submit_button("➕ Adicionar bloco")
+                if add_bloco and materia_bloco.strip():
+                    run_query(
+                        """INSERT INTO timeline_blocks (user_id, block_date, start_time, end_time, subject_name, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (USER_ID, data_sel.isoformat(), hora_ini.strftime("%H:%M"), hora_fim.strftime("%H:%M"),
+                         materia_bloco.strip(), datetime.now().isoformat()),
+                    )
+                    st.rerun()
+
+            st.divider()
+            st.markdown("**🧠 Notas & pensamentos / resumos**")
+            notas_valor = st.text_area(
+                "Anotações rápidas (salvas automaticamente ao sair do campo)",
+                value=log_dia["notas"] or "", height=100, key=f"notas_{data_sel.isoformat()}",
+                on_change=lambda: atualizar_daily_log_campo(
+                    USER_ID, data_sel.isoformat(), "notas", st.session_state[f"notas_{data_sel.isoformat()}"]
+                ),
+            )
+
+            st.markdown("**🗒️ Observações de estudos do dia**")
+            observ_valor = st.text_area("Observações gerais", value=log_dia["observacoes"] or "", height=80, key="observacoes_dia")
+            if st.button("💾 Salvar observações"):
+                atualizar_daily_log_campo(USER_ID, data_sel.isoformat(), "observacoes", observ_valor)
+                st.success("Observações salvas!")
+
+    # -----------------------------------------------------------------
+    # VISÃO ANUAL
+    # -----------------------------------------------------------------
+    with aba_anual:
+        ano_anual = st.number_input("Ano", min_value=2020, max_value=2100, value=date.today().year, step=1, key="ano_anual_planner")
+        tarefas_ano = df_query(
+            "SELECT * FROM tasks WHERE user_id = ? AND task_date LIKE ? AND status = 'concluido'",
+            (USER_ID, f"{int(ano_anual)}-%"),
+        )
+        if tarefas_ano.empty:
+            st.info("Nenhuma tarefa concluída registrada neste ano ainda.")
+        else:
+            tarefas_ano["mes"] = tarefas_ano["task_date"].str.slice(5, 7).astype(int)
+            contagem_mensal = tarefas_ano.groupby("mes").size().reindex(range(1, 13), fill_value=0)
+            nomes_meses_curto = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+            fig_anual = px.bar(
+                x=nomes_meses_curto, y=contagem_mensal.values,
+                labels={"x": "Mês", "y": "Tarefas concluídas"}, title=f"Tarefas concluídas por mês - {int(ano_anual)}",
+            )
+            fig_anual.update_traces(marker_color="#5B8DEF")
+            fig_anual.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_anual, use_container_width=True)
+        render_heatmap_constancia(USER_ID)
 
 # =============================================================================
 # PÁGINA 2 - CRONOGRAMA, PESOS E CICLO DE ESTUDOS
@@ -1826,14 +2450,7 @@ elif pagina == "🗓️ Provas e Calendário":
                 unsafe_allow_html=True,
             )
             # Link para adicionar ao Google Calendar (sem necessidade de OAuth/credenciais)
-            data_gcal = datetime.fromisoformat(prova["exam_date"]).strftime("%Y%m%d")
-            data_gcal_fim = (datetime.fromisoformat(prova["exam_date"]) + timedelta(days=1)).strftime("%Y%m%d")
-            url_gcal = (
-                "https://calendar.google.com/calendar/render?action=TEMPLATE"
-                f"&text={prova['name'].replace(' ', '+')}"
-                f"&dates={data_gcal}/{data_gcal_fim}"
-                f"&location={(prova['location'] or '').replace(' ', '+')}"
-            )
+            url_gcal = gerar_link_google_calendar(prova["name"], prova["exam_date"], local=prova["location"] or "")
             colpr2.link_button("📅 Google Agenda", url_gcal, use_container_width=True)
             if colpr3.button("🗑️", key=f"del_prova_{prova['id']}"):
                 run_query("DELETE FROM exams WHERE id = ?", (int(prova["id"]),))
@@ -1866,7 +2483,6 @@ elif pagina == "🗓️ Provas e Calendário":
             if p["exam_date"].startswith(f"{ano_sel}-{mes_sel:02d}"):
                 provas_do_mes[p["exam_date"]] = p["name"]
 
-    import calendar as calendar_lib
     cal = calendar_lib.Calendar(firstweekday=0)
     semanas_mes = cal.monthdayscalendar(int(ano_sel), int(mes_sel))
 
@@ -2109,11 +2725,12 @@ elif pagina == "🎴 Flashcards (SM-2)":
             else:
                 sid_deck = int(subjects_df.loc[subjects_df["name"] == materia_deck_sel, "id"].values[0])
 
-            run_query(
-                "INSERT INTO decks (subject_id, name, topic, color, created_at) VALUES (?, ?, ?, ?, ?)",
+            resultado_deck = run_query(
+                "INSERT INTO decks (subject_id, name, topic, color, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
                 (int(sid_deck), nome_deck.strip(), topico_deck.strip(), cor_deck, datetime.now().isoformat()),
+                fetch=True,
             )
-            deck_id_novo = df_query("SELECT last_insert_rowid() as id").iloc[0]["id"]
+            deck_id_novo = int(resultado_deck[0])
 
             texto_limpo_deck = limpar_texto_medico(conteudo_deck)
             cliente_deck = obter_cliente_anthropic() if usar_ia_deck else None
@@ -2196,7 +2813,7 @@ elif pagina == "🎴 Flashcards (SM-2)":
                     sid = int(subjects_df.loc[subjects_df["name"] == materia_fc, "id"].values[0])
                     run_query(
                         """INSERT INTO flashcards
-                           (subject_id, front, back, ease, interval, repetitions, due_date, created_at, source)
+                           (subject_id, front, back, ease, review_interval, repetitions, due_date, created_at, source)
                            VALUES (?, ?, ?, 2.5, 0, 0, ?, ?, 'manual')""",
                         (sid, frente.strip(), verso.strip(), date.today().isoformat(), datetime.now().isoformat()),
                     )
@@ -2301,10 +2918,10 @@ elif pagina == "🎴 Flashcards (SM-2)":
             def avaliar(qualidade):
                 reps, ease, interval, due = sm2(
                     qualidade, int(card["repetitions"]), float(card["ease"]),
-                    float(card["interval"]), urgencia,
+                    float(card["review_interval"]), urgencia,
                 )
                 run_query(
-                    """UPDATE flashcards SET repetitions = ?, ease = ?, interval = ?,
+                    """UPDATE flashcards SET repetitions = ?, ease = ?, review_interval = ?,
                        due_date = ?, last_review = ? WHERE id = ?""",
                     (reps, ease, interval, due, datetime.now().isoformat(), card_id),
                 )
@@ -2313,7 +2930,10 @@ elif pagina == "🎴 Flashcards (SM-2)":
                     (card_id, qualidade, datetime.now().isoformat()),
                 )
                 registrar_estudo(int(card["subject_id"]), 2, "flashcard")
+                subiu_nivel, _ = conceder_xp(USER_ID, 5)
                 st.session_state.show_answer_map[card_id] = False
+                if subiu_nivel:
+                    st.balloons()
                 st.rerun()
 
             if colb1.button("❌ Errado/Difícil"):
@@ -2486,6 +3106,10 @@ elif pagina == "❓ Simulador de Questões":
                 if q["explanation"]:
                     st.info(f"📖 Comentário: {q['explanation']}")
 
+                subiu_nivel, _ = conceder_xp(USER_ID, 8 if acertou else 3)
+                if subiu_nivel:
+                    st.balloons()
+
                 quiz["index"] += 1
                 if quiz["index"] >= len(questoes):
                     quiz["finished"] = True
@@ -2654,6 +3278,10 @@ elif pagina == "🧪 Gerador de Simulados (IA)":
                     st.error(f"❌ Resposta incorreta. Gabarito: {correta}")
                 st.info(f"📖 Gabarito comentado: {q['explanation']}")
 
+                subiu_nivel, _ = conceder_xp(USER_ID, 12 if acertou else 4)
+                if subiu_nivel:
+                    st.balloons()
+
                 quiz_ia["index"] += 1
                 if quiz_ia["index"] >= len(questoes):
                     quiz_ia["finished"] = True
@@ -2751,7 +3379,10 @@ elif pagina == "🍅 Pomodoro":
                     registrar_estudo(sid, minutos_foco, "pomodoro")
                 st.session_state.pomodoro_cycle_count += 1
                 st.session_state.pomodoro_mode = "pausa"
+                subiu_nivel, _ = conceder_xp(USER_ID, 15)
                 st.toast("✅ Ciclo de foco concluído! Hora da pausa.")
+                if subiu_nivel:
+                    st.balloons()
             else:
                 st.session_state.pomodoro_mode = "foco"
                 st.toast("🔔 Pausa concluída! Hora de focar novamente.")
@@ -2850,6 +3481,178 @@ elif pagina == "📊 Relatórios e Ebbinghaus":
         height=400,
     )
     st.plotly_chart(fig_ebb, use_container_width=True)
+
+# =============================================================================
+# PÁGINA - MEU PERFIL (nome, foto, status)
+# =============================================================================
+elif pagina == "🙋 Meu Perfil":
+    st.title("🙋 Meu Perfil")
+
+    dados_perfil = df_query(
+        "SELECT username, display_name, foto_perfil, status_atual, xp, nivel, streak FROM users WHERE id = ?",
+        (USER_ID,),
+    ).iloc[0]
+
+    col_foto, col_dados = st.columns([1, 2])
+    with col_foto:
+        if dados_perfil["foto_perfil"]:
+            st.markdown(
+                f"""<img src="data:image/jpeg;base64,{dados_perfil['foto_perfil']}"
+                        style="width:160px;height:160px;border-radius:50%;object-fit:cover;
+                        border:3px solid var(--cm-accent);" />""",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """<div style="width:160px;height:160px;border-radius:50%;background:rgba(255,255,255,0.08);
+                        display:flex;align-items:center;justify-content:center;font-size:3rem;">🙂</div>""",
+                unsafe_allow_html=True,
+            )
+        nova_foto = st.file_uploader("Alterar foto de perfil", type=["jpg", "jpeg", "png"])
+
+    with col_dados:
+        st.metric("🏅 Nível", dados_perfil["nivel"])
+        st.metric("⭐ XP total", dados_perfil["xp"])
+        st.metric("🔥 Ofensiva", f"{dados_perfil['streak']} dia(s)")
+
+    st.divider()
+    with st.form("form_meu_perfil"):
+        novo_display_name = st.text_input("Nome / apelido de exibição", value=dados_perfil["display_name"] or dados_perfil["username"])
+        novo_status_perfil = st.text_input("Status atual", value=dados_perfil["status_atual"] or "", placeholder="Ex: Estudando Cardiologia")
+        salvar_perfil = st.form_submit_button("💾 Salvar perfil")
+
+    if salvar_perfil:
+        foto_base64 = dados_perfil["foto_perfil"]
+        if nova_foto is not None:
+            try:
+                from PIL import Image
+                img = Image.open(nova_foto).convert("RGB")
+                img.thumbnail((300, 300))
+                buffer = io.BytesIO()
+                img.save(buffer, format="JPEG", quality=80)
+                foto_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            except ImportError:
+                # Sem Pillow instalado: guarda a imagem original em base64 (sem redimensionar)
+                foto_base64 = base64.b64encode(nova_foto.read()).decode("utf-8")
+        run_query(
+            "UPDATE users SET display_name = ?, status_atual = ?, foto_perfil = ? WHERE id = ?",
+            (novo_display_name.strip(), novo_status_perfil.strip(), foto_base64, USER_ID),
+        )
+        st.success("Perfil atualizado!")
+        st.rerun()
+
+# =============================================================================
+# PÁGINA - RANKING / LEADERBOARD
+# =============================================================================
+elif pagina == "🏆 Ranking":
+    st.title("🏆 Ranking")
+    st.caption("Os usuários com mais XP e maior ofensiva da plataforma.")
+
+    ranking_df = df_query(
+        """SELECT username, display_name, foto_perfil, xp, nivel, streak FROM users
+           WHERE is_active = TRUE ORDER BY xp DESC, streak DESC LIMIT 50"""
+    )
+    if ranking_df.empty:
+        st.info("Ainda não há usuários suficientes para exibir o ranking.")
+    else:
+        for posicao, (_, u) in enumerate(ranking_df.iterrows(), start=1):
+            nome_exibicao = u["display_name"] or u["username"]
+            medalha = {1: "🥇", 2: "🥈", 3: "🥉"}.get(posicao, f"#{posicao}")
+            col_pos, col_foto_r, col_info = st.columns([0.6, 0.8, 4])
+            col_pos.markdown(f"### {medalha}")
+            with col_foto_r:
+                if u["foto_perfil"]:
+                    st.markdown(
+                        f"""<img src="data:image/jpeg;base64,{u['foto_perfil']}"
+                                style="width:44px;height:44px;border-radius:50%;object-fit:cover;" />""",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown("🙂")
+            col_info.markdown(
+                f"**{nome_exibicao}** · Nível {u['nivel']} · {u['xp']} XP · 🔥 {u['streak']} dia(s)"
+            )
+
+# =============================================================================
+# PÁGINA - PAINEL ADMIN
+# =============================================================================
+elif pagina == "🛡️ Painel Admin":
+    if not st.session_state.get("is_admin"):
+        st.error("Acesso restrito a administradores.")
+        st.stop()
+
+    st.title("🛡️ Painel de Administração")
+
+    usuarios_df = df_query(
+        """SELECT id, username, display_name, created_at, is_admin, is_active, xp, nivel
+           FROM users ORDER BY id ASC"""
+    )
+    st.subheader("👥 Usuários cadastrados")
+    st.dataframe(
+        usuarios_df.rename(columns={
+            "id": "ID", "username": "Usuário", "display_name": "Nome de exibição",
+            "created_at": "Cadastrado em", "is_admin": "Admin?", "is_active": "Ativo?",
+            "xp": "XP", "nivel": "Nível",
+        }),
+        use_container_width=True, hide_index=True,
+    )
+
+    st.divider()
+    st.subheader("⚙️ Gerenciar conta por ID")
+    ids_usuarios = usuarios_df["id"].tolist()
+    if ids_usuarios:
+        id_selecionado = st.selectbox(
+            "Selecione o usuário", ids_usuarios,
+            format_func=lambda uid: f"#{uid} · {usuarios_df.loc[usuarios_df['id'] == uid, 'username'].values[0]}",
+        )
+        linha_admin = usuarios_df.loc[usuarios_df["id"] == id_selecionado].iloc[0]
+
+        colA1, colA2, colA3 = st.columns(3)
+        if bool(linha_admin["is_active"]):
+            if colA1.button("🚫 Suspender conta"):
+                if int(id_selecionado) == USER_ID:
+                    st.warning("Você não pode suspender a própria conta.")
+                else:
+                    run_query("UPDATE users SET is_active = FALSE WHERE id = ?", (int(id_selecionado),))
+                    st.success("Conta suspensa.")
+                    st.rerun()
+        else:
+            if colA1.button("✅ Reativar conta"):
+                run_query("UPDATE users SET is_active = TRUE WHERE id = ?", (int(id_selecionado),))
+                st.success("Conta reativada.")
+                st.rerun()
+
+        if bool(linha_admin["is_admin"]):
+            if colA2.button("⬇️ Remover admin"):
+                if int(id_selecionado) == USER_ID:
+                    st.warning("Você não pode remover seu próprio acesso de admin.")
+                else:
+                    run_query("UPDATE users SET is_admin = FALSE WHERE id = ?", (int(id_selecionado),))
+                    st.success("Acesso de admin removido.")
+                    st.rerun()
+        else:
+            if colA2.button("⬆️ Tornar admin"):
+                run_query("UPDATE users SET is_admin = TRUE WHERE id = ?", (int(id_selecionado),))
+                st.success("Usuário promovido a admin.")
+                st.rerun()
+
+        if colA3.button("🗑️ Excluir definitivamente", type="secondary"):
+            st.session_state["confirmar_exclusao_usuario"] = int(id_selecionado)
+
+        if st.session_state.get("confirmar_exclusao_usuario") == int(id_selecionado):
+            st.error(f"Confirma a exclusão definitiva de **{linha_admin['username']}** e todos os seus dados?")
+            colE1, colE2 = st.columns(2)
+            if colE1.button("✅ Sim, excluir definitivamente"):
+                if int(id_selecionado) == USER_ID:
+                    st.warning("Você não pode excluir a própria conta enquanto estiver logado.")
+                else:
+                    run_query("DELETE FROM users WHERE id = ?", (int(id_selecionado),))
+                    st.session_state.pop("confirmar_exclusao_usuario", None)
+                    st.success("Usuário excluído.")
+                    st.rerun()
+            if colE2.button("❌ Cancelar"):
+                st.session_state.pop("confirmar_exclusao_usuario", None)
+                st.rerun()
 
 # =============================================================================
 # RODAPÉ

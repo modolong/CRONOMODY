@@ -1958,9 +1958,14 @@ elif pagina == "🗂️ Planner de Estudos":
                 intensidade = min(1.0, qtd / 4) if qtd else 0
                 cor_fundo = f"rgba(91,141,239,{0.15 + intensidade * 0.5})" if qtd else "rgba(255,255,255,0.04)"
                 grid_html += (
-                    f"<td style='background:{cor_fundo}; border-radius:10px; text-align:center; "
-                    f"padding:10px 4px; color:var(--cm-text-main); font-size:0.85rem'>{dia}"
-                    f"{f'<br><span style=\"font-size:0.7rem\">{qtd} tarefa(s)</span>' if qtd else ''}</td>"
+                   1961        html_interno = f"<br><span style='font-size:0.7rem'>{qtd} tarefas</span>"
+1962        grid_html += (
+1963            f"<tr>"
+1964            f"<td style='background:{cor_fundo}; border-radius:10px; padding:10px 4px; color:var(--cm-text-main); font-size:0.9rem; font-family:sans-serif; text-align:center; vertical-align:middle; border: 0.5px solid var(--cm-bg-secondary)'>"
+1965            f"{html_interno}"
+1966            f"</td>"
+1967            f"</tr>"
+1968        )
                 )
             grid_html += "</tr>"
         grid_html += "</table>"

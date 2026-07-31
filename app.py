@@ -1960,7 +1960,7 @@ elif pagina == "🗂️ Planner de Estudos":
                 grid_html += (
                     f"<td style='background:{cor_fundo}; border-radius:10px; text-align:center; "
                     f"padding:10px 4px; color:var(--cm-text-main); font-size:0.85rem'>{dia}"
-                    f"{f'<br><span style=\"font-size:0.7rem\">{qtd} tarefa(s)</span>' if qtd else ''}</td>"
+                    f"{f'<br><span style="font-size:0.7rem">{qtd} tarefa(s)</span>' if qtd else ''}</td>"
                 )
             grid_html += "</tr>"
         grid_html += "</table>"

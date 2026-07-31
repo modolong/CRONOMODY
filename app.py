@@ -1960,12 +1960,6 @@ elif pagina == "🗂️ Planner de Estudos":
         html_interno = f"<br><span style='font-size:0.7rem'>{qtd}</span>" if qtd else ""
         
         grid_html += f"<td style='background:{cor_fundo}; border-radius:10px; padding:5px; text-align:center;'>{dia}{html_interno}</td>"
-                )
-            grid_html += "</tr>"
-        grid_html += "</table>"
-        st.markdown(grid_html, unsafe_allow_html=True)
-
-        st.divider()
         st.subheader("✅ Checklist diário de matérias")
         data_checklist = st.date_input(
             "Selecione o dia para o checklist", value=date.today(),

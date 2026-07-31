@@ -1950,7 +1950,7 @@ elif pagina == "🗂️ Planner de Estudos":
         for semana in semanas_mes:
          grid_html += "<tr>"    
          for dia in semana:
-        if dia == 0:
+         if dia == 0:
             grid_html += "<td></td>"
             continue
 

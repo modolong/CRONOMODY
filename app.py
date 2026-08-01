@@ -87,7 +87,7 @@ def obter_dsn_neon() -> str:
     """
     try:
         if "NEON_DATABASE_URL" in st.secrets:
-            return st.secrets["NEON_DATABASE_URL"]
+            return st.secrets["connections"]["sql"]["NEON_DATABASE_URL"]
     except Exception:
         pass
     return os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
@@ -257,14 +257,14 @@ def obter_conexao_streamlit():
     dsn = obter_dsn_neon()
     if not dsn:
         st.error(
-            "🔌 Não foi possível conectar ao banco de dados Neon: nenhuma string de conexão "
+            "🔌 blablabaNão foi possível conectar ao banco de dados Neon: nenhuma string de conexão "
             "encontrada. Configure `NEON_DATABASE_URL` em `.streamlit/secrets.toml` (ou como "
             "variável de ambiente) com a Connection String fornecida pelo painel do Neon "
             "(Dashboard → Connection Details), no formato:\n\n"
             "`postgresql://usuario:senha@ep-xxxxx-pooler.regiao.aws.neon.tech/nomedobanco?sslmode=require`"
         )
         st.stop()
-    return st.connection("neondb", type="sql", url=dsn)
+    return st.connection("neon_db", type="sql", url=dsn)
 
 
 def get_conn():

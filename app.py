@@ -86,7 +86,7 @@ def obter_dsn_neon() -> str:
     postgresql://usuario:senha@ep-xxxxx.us-east-2.aws.neon.tech/nomedobanco?sslmode=require
     """
     try:
-        if "NEON_DATABASE_URL" in st.secrets:
+        if "NEON_DATABASE_URL" in st.secrets["connections"]["sql"]:
             return st.secrets["connections"]["sql"]["NEON_DATABASE_URL"]
     except Exception:
         pass

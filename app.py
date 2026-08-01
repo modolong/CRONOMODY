@@ -264,7 +264,7 @@ def obter_conexao_streamlit():
             "`postgresql://usuario:senha@ep-xxxxx-pooler.regiao.aws.neon.tech/nomedobanco?sslmode=require`"
         )
         st.stop()
-    return st.connection("neon_db", type="sql", url="postgresql://neondb_owner:npg_lK7Y3OoFCpqg@ep-gentle-darkness-ayuzusl9-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
+    return st.connection("sql", type="sql", url="postgresql://neondb_owner:npg_lK7Y3OoFCpqg@ep-gentle-darkness-ayuzusl9-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
 
 
 def get_conn():
